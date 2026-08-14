@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+Railway Instagram Reels Automation Control Plane
+
+No Hermes. No LLM.
+
+Features
+--------
+- Long-running Railway service
+- Persistent SQLite state on a Railway Volume
+- 4x/day default scheduler in Asia/Kolkata
+- Telegram owner-only control bot
+- Inline dashboard buttons
+- Success/failure/startup/daily reports
+- Pause/resume without redeploying
+- Change schedule from Telegram
+- Post-next-now with confirmation
+- Dry-run / next-candidate / caption preview
+- Skip-next with confirmation
+- Retry a failed/skipped reel by reel number
+- Stats, history and error inspection
+- Health endpoint for Railway
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+import instagram_reel_poster as poster
+
+
+# --------------------------- Configuration ---------------------------
+
+IST = ZoneInfo(os.getenv("AUTOMATION_TIMEZONE", "Asia/Kolkata"))
+DEFAULT_SCHEDULE = os.getenv(
+    "REEL_POST_TIMES",
+    "09:30,13:30,17:30,21:30",
+).strip()
+DEFAULT_DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "22:15").strip()
+
+TG_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    or os.getenv("TELEGRAM_TOKEN", "").strip()
+    or os.getenv("TG_BOT_TOKEN", "").strip()
+)
+TG_REPORT_CHAT = (
+    os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    or os.getenv("TG_CHAT_ID", "").strip()
+)
+TG_ALLOWED_RAW = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
+DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+STARTUP_REPORT_ENABLED = os.getenv("STARTUP_REPORT_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+PORT = int(os.getenv("PORT", "8080"))
+
+APP_VERSION = "4.0.0"
+BOT_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
+POST_MUTEX = threading.Lock()
+CATALOG_MUTEX = threading.Lock()
+CATALOG_CACHE: dict[str, Any] = {"at": 0.0, "videos": None}
+CATALOG_TTL = max(30, int(os.getenv("DRIVE_CATALOG_CACHE_SECONDS", "600")))
+STOP_EVENT = threading.Event()
+
+
+def now_ist() -> dt.datetime:
+    return dt.datetime.now(IST)
+
+
+def iso_utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def short_error(exc: BaseException) -> str:
+    text = poster.sanitize(f"{type(exc).__name__}: {exc}")
+    return text[:1200]
+
+
+# --------------------------- SQLite control tables ---------------------------
+
+def db() -> sqlite3.Connection:
+    conn = poster.connect_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            trigger_source TEXT,
+            reel_number INTEGER,
+            file_id TEXT,
+            filename TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_slots (
+            slot_key TEXT PRIMARY KEY,
+            claimed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def get_setting(key: str, default: str) -> str:
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT value FROM automation_settings WHERE key=?",
+            (key,),
+        ).fetchone()
+        return str(row[0]) if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO automation_settings(key,value,updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (key, value, iso_utc()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_paused() -> bool:
+    return get_setting("paused", "0") == "1"
+
+
+def set_paused(paused: bool) -> None:
+    set_setting("paused", "1" if paused else "0")
+
+
+def log_event(
+    event_type: str,
+    status: str,
+    trigger_source: str = "",
+    reel_number: Optional[int] = None,
+    file_id: str = "",
+    filename: str = "",
+    detail: str = "",
+) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO automation_events
+            (event_type,status,trigger_source,reel_number,file_id,filename,detail,created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_type,
+                status,
+                trigger_source,
+                reel_number,
+                file_id,
+                filename,
+                poster.sanitize(detail)[:2500],
+                iso_utc(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def claim_slot(slot_key: str) -> bool:
+    conn = db()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO automation_slots(slot_key,claimed_at) VALUES(?,?)",
+                (slot_key, iso_utc()),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        conn.close()
+
+
+# --------------------------- Schedule ---------------------------
+
+def validate_time(value: str) -> str:
+    try:
+        parsed = dt.datetime.strptime(value, "%H:%M")
+    except ValueError as exc:
+        raise ValueError(f"Invalid time '{value}'. Use HH:MM in 24-hour format.") from exc
+    return parsed.strftime("%H:%M")
+
+
+def schedule_times() -> list[str]:
+    raw = get_setting("post_times", DEFAULT_SCHEDULE)
+    values = [v.strip() for v in raw.replace(" ", ",").split(",") if v.strip()]
+    clean = sorted({validate_time(v) for v in values})
+    if not clean:
+        clean = ["09:30", "13:30", "17:30", "21:30"]
+    return clean
+
+
+def update_schedule(values: list[str]) -> list[str]:
+    clean = sorted({validate_time(v) for v in values})
+    if not 1 <= len(clean) <= 12:
+        raise ValueError("Schedule must contain between 1 and 12 posting times.")
+    set_setting("post_times", ",".join(clean))
+    return clean
+
+
+def next_scheduled_time() -> Optional[dt.datetime]:
+    if is_paused():
+        return None
+    now = now_ist()
+    for add_days in range(0, 8):
+        day = (now + dt.timedelta(days=add_days)).date()
+        for value in schedule_times():
+            hh, mm = map(int, value.split(":"))
+            candidate = dt.datetime.combine(day, dt.time(hh, mm), IST)
+            if candidate > now:
+                return candidate
+    return None
+
+
+def fmt_next_run() -> str:
+    nxt = next_scheduled_time()
+    if nxt is None:
+        return "PAUSED"
+    return nxt.strftime("%d %b %Y, %I:%M %p IST")
+
+
+# --------------------------- Drive catalog / queue helpers ---------------------------
+
+def get_catalog(force: bool = False) -> list[poster.DriveVideo]:
+    with CATALOG_MUTEX:
+        cached = CATALOG_CACHE.get("videos")
+        age = time.monotonic() - float(CATALOG_CACHE.get("at") or 0)
+        if not force and cached is not None and age < CATALOG_TTL:
+            return cached
+        videos = poster.list_drive_videos()
+        CATALOG_CACHE["videos"] = videos
+        CATALOG_CACHE["at"] = time.monotonic()
+        return videos
+
+
+def prepare_catalog(force: bool = False) -> tuple[list[poster.DriveVideo], sqlite3.Connection]:
+    videos = get_catalog(force=force)
+    conn = db()
+    poster.seed_known_posted(conn, videos)
+    for video in videos:
+        poster.upsert_seen(conn, video)
+    conn.commit()
+    return videos, conn
+
+
+def preview_next(force: bool = False) -> tuple[Optional[poster.DriveVideo], Optional[str]]:
+    videos, conn = prepare_catalog(force=force)
+    try:
+        candidate = poster.select_candidate(conn, videos)
+        if candidate is None:
+            return None, None
+        caption = poster.make_caption(candidate, poster.previous_posted_caption(conn))
+        return candidate, caption
+    finally:
+        conn.close()
+
+
+def get_row_for_file(file_id: str) -> Optional[sqlite3.Row]:
+    conn = db()
+    try:
+        return conn.execute(
+            "SELECT * FROM reel_posts_v2 WHERE file_id=?",
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def latest_attempt_row(since: Optional[str] = None) -> Optional[sqlite3.Row]:
+    conn = db()
+    try:
+        if since:
+            return conn.execute(
+                """
+                SELECT * FROM reel_posts_v2
+                WHERE last_attempt_at IS NOT NULL AND last_attempt_at>=?
+                ORDER BY last_attempt_at DESC
+                LIMIT 1
+                """,
+                (since,),
+            ).fetchone()
+        return conn.execute(
+            """
+            SELECT * FROM reel_posts_v2
+            WHERE last_attempt_at IS NOT NULL
+            ORDER BY last_attempt_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def queue_counts() -> dict[str, int]:
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM reel_posts_v2 GROUP BY status"
+        ).fetchall()
+        result = {str(r["status"]): int(r["n"]) for r in rows}
+        result["known_total"] = sum(result.values())
+        return result
+    finally:
+        conn.close()
+
+
+def stats_text(include_next: bool = True) -> str:
+    conn = db()
+    try:
+        counts = {
+            str(r["status"]): int(r["n"])
+            for r in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM reel_posts_v2 GROUP BY status"
+            ).fetchall()
+        }
+        today = now_ist().date()
+        start_utc = dt.datetime.combine(today, dt.time.min, IST).astimezone(dt.timezone.utc).isoformat()
+        end_utc = dt.datetime.combine(today + dt.timedelta(days=1), dt.time.min, IST).astimezone(dt.timezone.utc).isoformat()
+        posted_today = conn.execute(
+            "SELECT COUNT(*) FROM reel_posts_v2 WHERE posted_at>=? AND posted_at<?",
+            (start_utc, end_utc),
+        ).fetchone()[0]
+        failures_today = conn.execute(
+            """
+            SELECT COUNT(*) FROM automation_events
+            WHERE event_type='post' AND status='failed'
+              AND created_at>=? AND created_at<?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    known = sum(counts.values())
+    lines = [
+        "AUTOMATION STATS",
+        f"Posted today: {posted_today}",
+        f"Failures today: {failures_today}",
+        f"Posted total: {counts.get('posted', 0)}",
+        f"Pending/failed: {counts.get('pending', 0) + counts.get('failed', 0)}",
+        f"Skipped: {counts.get('skipped', 0)}",
+        f"Uncertain: {counts.get('uncertain', 0)}",
+        f"Known files in DB: {known}",
+        f"Automation: {'PAUSED' if is_paused() else 'RUNNING'}",
+        f"Schedule: {', '.join(schedule_times())} IST",
+        f"Next scheduled: {fmt_next_run()}",
+    ]
+    if include_next:
+        try:
+            candidate, _ = preview_next()
+            lines.append(
+                "Next candidate: "
+                + (
+                    f"#{candidate.reel_number} — {candidate.name}"
+                    if candidate else "NONE"
+                )
+            )
+        except Exception as exc:
+            lines.append(f"Next candidate: unavailable ({short_error(exc)})")
+    return "\n".join(lines)
+
+
+def history_text(limit: int = 8) -> str:
+    limit = max(1, min(limit, 20))
+    conn = db()
+    try:
