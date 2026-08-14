@@ -38,7 +38,7 @@ Attach a Railway Volume at `/opt/data`. The app automatically uses `RAILWAY_VOLU
 5. In Telegram send `/panel`, then `/dryrun`.
 6. Confirm the correct next Reel before allowing live posting.
 
-The repository stores the two larger Python source files in `source_parts/`. `bootstrap.py` reconstructs them byte-for-byte at startup and verifies SHA-256 checksums before execution. This packaging is only for repository transport; runtime behavior is the same as the validated source.
+The two validated Python source files are stored as gzip-compressed Base64 payload chunks under `payloads/`. `bootstrap.py` reconstructs them in a temporary runtime directory and verifies the original SHA-256 checksums before execution. Railway therefore refuses to start if the payload is incomplete or altered.
 
 ## Default schedule
 
