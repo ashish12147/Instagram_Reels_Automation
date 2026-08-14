@@ -94,14 +94,42 @@ def install_instagram_video_url_patch(poster, app) -> None:
                 "Instagram container response did not include an id"
             )
 
+        # Preserve the original function's tuple return contract. upload_binary()
+        # is patched to a no-op because Instagram now fetches video_url itself.
         return container_id, "railway-video-url"
 
     def upload_binary_noop(upload_uri, video_path):
         return None
 
+    def poll_container_current(container_id: str):
+        # Meta's current Reel container status endpoint exposes status_code + status.
+        # Do not request the obsolete/nonexistent video_status field.
+        deadline = poster.time.monotonic() + poster.POLL_TIMEOUT
+        last = {}
+        while poster.time.monotonic() < deadline:
+            last = poster.graph_request(
+                "GET",
+                container_id,
+                {"fields": "id,status_code,status"},
+            )
+            status_code = str(last.get("status_code") or "").upper()
+            if status_code == "FINISHED":
+                return last
+            if status_code in {"ERROR", "EXPIRED"}:
+                raise poster.ReelPosterError(
+                    f"Instagram container {container_id} ended with {status_code}: "
+                    f"{poster.sanitize(last.get('status') or last)}"
+                )
+            poster.time.sleep(poster.POLL_INTERVAL)
+        raise poster.ReelPosterError(
+            f"Instagram container {container_id} did not reach FINISHED within "
+            f"{poster.POLL_TIMEOUT}s; last status={poster.sanitize(last)}"
+        )
+
     poster.download_video = download_video_and_stage
     poster.create_reel_container = create_reel_container
     poster.upload_binary = upload_binary_noop
+    poster.poll_container = poll_container_current
     poster.PUBLIC_MEDIA_BASE_URL = public_base_url()
 
     def serve_media(handler, head_only: bool = False) -> bool:
